@@ -5,10 +5,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# rasterio wheels bundle GDAL, so we don't need the OSGeo image.
-# Just need a healthcheck-capable curl and ca-certificates.
+# rasterio wheels bundle GDAL, but a few transitive C libs are stripped from
+# python:slim and must be added explicitly:
+#   libexpat1 - XML parser PROJ uses; rasterio import fails without it
+#   libxml2   - XML parsing used by some GDAL drivers
+#   curl      - healthcheck script
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
+        libexpat1 libxml2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
