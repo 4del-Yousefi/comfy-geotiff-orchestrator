@@ -222,8 +222,32 @@ No auth, returns `{"ok": true}`.
 
 - **`MAX_TILE_COUNT`** caps jobs that would explode (e.g., 1024×1024 input with tile_size=64 → 1024 tiles).
 - **`RUNPOD_MAX_CONCURRENT`** should not exceed your RunPod endpoint's `max_workers × 2–3`. Above that, requests pile up in RunPod's queue and the orchestrator just sits idle.
-- **`MAX_CONCURRENT_JOBS`** limits how many *user* jobs run concurrently on the box. On CPX32 (8 GB RAM), 2 is safe; the output canvas dominates memory.
+- **`MAX_CONCURRENT_JOBS`** limits how many *user* jobs run concurrently on the box. CPX32 with the disk-backed canvas handles 2 concurrent large jobs comfortably.
+- **`UPSCALE_FACTOR`** — 4 by default to match the Wan2.1 2× VAE applied twice in the workflow. Change if you swap the workflow.
 - **Persistent storage** — make sure Coolify's volume is mounted at `/data` so SQLite job history survives redeploys.
+
+## Scaling at 4× upscale (512 input tile → 2048 output tile)
+
+The orchestrator uses a **disk-backed memmap canvas** for stitching, so RAM stays bounded regardless of output size. The constraint becomes disk and CPU, not memory.
+
+| Input area | # tiles (overlap 0.125) | Output dims | Output GeoTIFF (compressed) | Scratch disk per job | Wall-clock @ 5 parallel RunPod workers |
+|---|---|---|---|---|---|
+| 6 k × 6 k | ~200 | 24 k × 24 k | ~1–2 GB | ~7 GB (accum) + ~2 GB (weights) | ~30 min |
+| 12 k × 12 k | ~800 | 48 k × 48 k | ~4–8 GB | ~28 GB + ~9 GB | ~2 hours |
+| 18 k × 18 k | ~1800 | 72 k × 72 k | ~10–18 GB | ~62 GB + ~20 GB | ~5 hours |
+
+**Disk** (per concurrent job): scratch ≈ output_pixels × 4 bytes × 4 (RGB float32 + weights float32). For an 18 k input → 72 k output, that's ~80 GB of scratch space *per job in flight*. CPX32 (160 GB SSD) handles 1 such job at a time; for 2 concurrent jobs of that scale, upgrade to CPX52 (480 GB SSD) or attach a Hetzner Volume.
+
+**Memory**: the OS page cache controls how much of the memmap stays resident. In practice you'll see ~1–2 GB resident regardless of canvas size on a CPX32. The 8 GB limit is fine; CPX42 (16 GB) gives more headroom for parallelism + the RunPod response buffers.
+
+**RunPod GPU cost** (rough, 4× upscale, 4-step Lightning, 24 GB tier):
+- ~30 s per tile × tile count × $0.00019/s
+- 200 tiles ≈ $1.20 per job
+- 800 tiles ≈ $4.50 per job
+- 1800 tiles ≈ $10 per job
+- **100 jobs × 800 tiles ≈ $450 in GPU bills**
+
+For long-running jobs, set RunPod **Min Workers ≥ 1** during a batch so cold starts don't dominate.
 
 ## Common failures and fixes
 

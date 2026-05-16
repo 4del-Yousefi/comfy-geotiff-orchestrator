@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     workflow_path: Path = Path("/app/workflows/qwen-image-edit-sr.api.json")
     # The workflow's LoadImage node references this filename.
     input_image_name: str = "test1.png"
-    # If the SR model upscales, set this. Qwen-Image-Edit at default settings
-    # is roughly 2× via the Wan2.1 VAE upscale step in this workflow.
-    upscale_factor: int = 2
+    # 512×512 input tile -> 2048×2048 output tile via the Wan2.1 2x VAE
+    # applied twice in this workflow = 4x linear upscale.
+    upscale_factor: int = 4
 
     # --- Storage paths ---
     jobs_db_path: Path = Path("/data/jobs.db")

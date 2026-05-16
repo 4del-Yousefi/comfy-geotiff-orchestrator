@@ -25,7 +25,7 @@ from rasterio.windows import Window
 from .config import Settings
 from .db import JobStore
 from .runpod_client import RunPodClient, RunPodError
-from .stitching import Canvas, feather_mask_2d
+from .stitching import DiskCanvas, feather_mask_2d
 from .storage import StorageClient
 from .tiling import Tile, compute_tiles
 
@@ -97,6 +97,8 @@ async def run_job(
     t0 = time.time()
     local_in: Path | None = None
     local_out: Path | None = None
+    canvas: DiskCanvas | None = None
+    job_scratch: Path | None = None
     try:
         job = await db.get(job_id)
         if job is None:
@@ -135,7 +137,13 @@ async def run_job(
 
                 out_w = src.width * upscale
                 out_h = src.height * upscale
-                canvas = Canvas(out_h, out_w, channels=3)
+
+                # Per-job scratch dir for the disk-backed canvas
+                job_scratch = settings.tmp_dir / f"{job_id}_canvas"
+                canvas = DiskCanvas(
+                    height=out_h, width=out_w, channels=3,
+                    scratch_dir=job_scratch,
+                )
 
                 out_tile_size = tile_size * upscale
                 # Feathered ramp covers half the overlap region on each side
@@ -173,7 +181,7 @@ async def run_job(
                                 )
                             )
 
-                        canvas.blit(
+                        await canvas.blit(
                             tile_rgb=tile_rgb_out,
                             x=tile.x0 * upscale,
                             y=tile.y0 * upscale,
@@ -189,10 +197,8 @@ async def run_job(
 
                 await asyncio.gather(*[process_one(t) for t in tiles])
 
-                # ---- 4. Finalize canvas + write GeoTIFF ----
-                await db.update(job_id, status="WRITING", progress_msg="stitching + writing geotiff")
-
-                final = canvas.finalize()  # uint8 (H, W, 3)
+                # ---- 4. Stream-write the disk-backed canvas to the output GeoTIFF ----
+                await db.update(job_id, status="WRITING", progress_msg="streaming geotiff to disk")
 
                 # New transform: pixel size shrinks by upscale_factor.
                 new_transform = src.transform * src.transform.scale(
@@ -200,19 +206,11 @@ async def run_job(
                 )
 
                 local_out = settings.tmp_dir / f"{job_id}_out.tif"
-                with rasterio.open(
-                    local_out, "w",
-                    driver="GTiff",
-                    width=out_w, height=out_h,
-                    count=3, dtype="uint8",
-                    crs=src.crs, transform=new_transform,
-                    compress="LZW", tiled=True,
-                    blockxsize=512, blockysize=512,
-                    photometric="rgb",
-                    BIGTIFF="IF_SAFER",
-                ) as dst:
-                    for b in range(3):
-                        dst.write(final[..., b], b + 1)
+                await canvas.finalize_to_geotiff(
+                    output_path=local_out,
+                    crs=src.crs,
+                    transform=new_transform,
+                )
 
         # ---- 5. Upload to R2 ----
         await db.update(job_id, status="UPLOADING", progress_msg="uploading output to R2")
@@ -234,6 +232,19 @@ async def run_job(
         except Exception:
             pass
     finally:
+        # Close + delete the disk-backed scratch canvas
+        if canvas is not None:
+            try:
+                canvas.close()
+            except Exception:
+                log.exception("canvas.close() failed")
+        if job_scratch is not None:
+            try:
+                # In case .close() left anything behind
+                if job_scratch.exists() and not any(job_scratch.iterdir()):
+                    job_scratch.rmdir()
+            except OSError:
+                pass
         for f in (local_in, local_out):
             if f is not None:
                 try:
