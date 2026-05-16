@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI):
         base_url=settings.runpod_base_url,
         poll_interval_sec=settings.runpod_poll_interval_sec,
         tile_timeout_sec=settings.runpod_tile_timeout_sec,
+        max_retries=settings.runpod_max_retries,
     )
     _job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
 

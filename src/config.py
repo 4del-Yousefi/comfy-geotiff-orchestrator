@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # Per-tile poll interval and timeout
     runpod_poll_interval_sec: float = 3.0
     runpod_tile_timeout_sec: int = 900
+    # How many times to retry a single tile if RunPod fails (bad worker /
+    # timeout / 5xx). Each retry submits a fresh job, often landing on a
+    # different worker. Default 2 = up to 3 total attempts per tile.
+    runpod_max_retries: int = 2
 
     # --- R2 / S3 ---
     r2_endpoint_url: str               # https://<account>.r2.cloudflarestorage.com
