@@ -44,30 +44,73 @@ def _encode_tile_png(tile_arr: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _read_tile_rgb(src, tile: Tile) -> np.ndarray:
-    """Read a tile from the source GeoTIFF and return it as HxWx3 uint8 RGB."""
+def _read_tile_rgb_and_mask(src, tile: Tile) -> tuple[np.ndarray, np.ndarray]:
+    """Read a tile and return (RGB uint8 HxWx3, valid_mask bool HxW).
+
+    valid_mask[y, x] == True  → pixel has real data, send to SR
+    valid_mask[y, x] == False → pixel is nodata/transparent; never let SR
+                                hallucinate something for it, never let it
+                                contaminate the neighboring tile blend.
+
+    Detection priority:
+      1. Alpha channel (band 4+) — pixel valid iff alpha > 0
+      2. GeoTIFF nodata value — pixel valid iff ANY band differs from nodata
+      3. All-zero fallback — pixel valid iff ANY band is non-zero
+    """
     win = Window(tile.x0, tile.y0, tile.size, tile.size)
     arr = src.read(window=win)  # (count, H, W)
 
     if arr.size == 0:
         raise ValueError(f"empty tile read at ({tile.x0}, {tile.y0})")
 
+    # ---- validity mask ----
+    if arr.shape[0] >= 4:
+        # 4-band imagery — assume last band is alpha
+        valid_mask = arr[-1] > 0
+    elif src.nodata is not None:
+        # explicit nodata value on the source
+        nodata = src.nodata
+        bands = arr[: min(3, arr.shape[0])]
+        valid_mask = np.any(bands != nodata, axis=0)
+    else:
+        # heuristic: a pixel is invalid if ALL bands are exactly 0
+        bands = arr[: min(3, arr.shape[0])]
+        valid_mask = np.any(bands != 0, axis=0)
+
+    # ---- RGB build ----
     if src.count == 1:
         band = arr[0]
         if band.dtype != np.uint8:
             band = _normalize_to_uint8(band)
         rgb = np.stack([band, band, band], axis=-1)
     else:
-        # Use first 3 bands; common GeoTIFFs are RGB or RGBN
         bands = arr[: min(3, src.count)]
         if bands.shape[0] < 3:
-            # Pad missing bands by repeating last band
             pad = [bands[-1]] * (3 - bands.shape[0])
             bands = np.stack(list(bands) + pad, axis=0)
         if bands.dtype != np.uint8:
             bands = np.stack([_normalize_to_uint8(b) for b in bands], axis=0)
-        rgb = np.transpose(bands, (1, 2, 0))  # (H, W, 3)
-    return np.ascontiguousarray(rgb)
+        rgb = np.transpose(bands, (1, 2, 0))
+
+    return np.ascontiguousarray(rgb), valid_mask
+
+
+def _read_tile_rgb(src, tile: Tile) -> np.ndarray:
+    """Back-compat shim — returns only RGB."""
+    rgb, _ = _read_tile_rgb_and_mask(src, tile)
+    return rgb
+
+
+def _upscale_mask_nearest(mask: np.ndarray, factor: int,
+                          target_h: int, target_w: int) -> np.ndarray:
+    """Nearest-neighbor upscale a bool mask to (target_h, target_w).
+    Used to align the per-input-pixel validity mask with the SR output tile."""
+    up = np.repeat(np.repeat(mask, factor, axis=0), factor, axis=1)
+    h, w = up.shape
+    if h < target_h or w < target_w:
+        up = np.pad(up, ((0, max(0, target_h - h)), (0, max(0, target_w - w))),
+                    mode="edge")
+    return up[:target_h, :target_w]
 
 
 def _normalize_to_uint8(band: np.ndarray) -> np.ndarray:
@@ -162,7 +205,26 @@ async def run_job(
 
                 async def process_one(tile: Tile) -> None:
                     async with semaphore:
-                        tile_rgb_in = _read_tile_rgb(src, tile)
+                        tile_rgb_in, valid_mask = _read_tile_rgb_and_mask(src, tile)
+
+                        # Skip entirely-nodata tiles — never send to GPU (saves money)
+                        # and never let them contaminate neighboring tile blends.
+                        if not valid_mask.any():
+                            log.info(
+                                f"tile {tile.idx} (x={tile.x0},y={tile.y0}) "
+                                f"is 100% nodata; skipping"
+                            )
+                            async with progress_lock:
+                                done_counter["n"] += 1
+                                await db.update(
+                                    job_id,
+                                    tiles_done=done_counter["n"],
+                                    progress_msg=(
+                                        f"processed {done_counter['n']}/{len(tiles)} tiles"
+                                    ),
+                                )
+                            return
+
                         b64 = _encode_tile_png(tile_rgb_in)
                         try:
                             png_bytes = await runpod.submit_and_wait(
@@ -186,11 +248,32 @@ async def run_job(
                                 )
                             )
 
+                        # If the input had any nodata pixels, upscale the validity
+                        # mask to the SR output resolution and zero those pixels in
+                        # both the tile and the blend weight. That way:
+                        #   - nodata regions don't get GPU-hallucinated content
+                        #   - nodata pixels in tile A don't dilute valid pixels in
+                        #     overlapping tile B
+                        oh, ow = tile_rgb_out.shape[:2]
+                        if not valid_mask.all():
+                            upscaled_valid = _upscale_mask_nearest(
+                                valid_mask, upscale, oh, ow
+                            )
+                            # Zero nodata pixels in the output tile
+                            tile_rgb_out = (
+                                tile_rgb_out.astype(np.float32)
+                                * upscaled_valid[..., np.newaxis]
+                            ).astype(np.uint8)
+                            # Zero the blend weight for nodata pixels
+                            blend_mask = mask[:oh, :ow] * upscaled_valid.astype(np.float32)
+                        else:
+                            blend_mask = mask[:oh, :ow]
+
                         await canvas.blit(
                             tile_rgb=tile_rgb_out,
                             x=tile.x0 * upscale,
                             y=tile.y0 * upscale,
-                            mask=mask,
+                            mask=blend_mask,
                         )
                         async with progress_lock:
                             done_counter["n"] += 1
