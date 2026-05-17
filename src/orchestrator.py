@@ -119,7 +119,12 @@ async def run_job(
         await db.update(job_id, status="TILING", progress_msg="reading geotiff")
         workflow = _load_workflow(settings.workflow_path)
 
-        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
+        # NOTE: don't wrap the whole pipeline in `rasterio.Env(...)` — its state
+        # is thread-local, and our async fan-out + the disk-backed canvas's
+        # finalize step run in worker threads that don't inherit the parent
+        # env, producing "No GDAL environment exists" errors mid-job.
+        # rasterio.open() establishes its own env per-call, which is enough.
+        if True:
             with rasterio.open(local_in) as src:
                 tiles = compute_tiles(src.width, src.height, tile_size, overlap_ratio)
                 if len(tiles) > settings.max_tile_count:
