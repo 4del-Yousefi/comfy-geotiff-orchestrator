@@ -129,6 +129,67 @@ def _decode_png_to_rgb(png_bytes: bytes) -> np.ndarray:
         return np.array(im)
 
 
+def _color_match_quadratic(
+    sr_rgb: np.ndarray,
+    input_rgb: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+    min_samples: int = 256,
+) -> np.ndarray:
+    """Per-channel quadratic color match: SR output → input's color statistics.
+
+    For each RGB channel, downscale the SR to input resolution, then solve
+    the least-squares fit  y = a*x^2 + b*x + c  where x is the downscaled SR
+    pixel value and y is the corresponding input pixel value. Apply the
+    fitted polynomial to the full-resolution SR output. The high-frequency
+    detail from SR is preserved; only the per-channel response curve shifts
+    to match the input.
+
+    If `valid_mask` is given (HxW bool over input resolution), only those
+    pixels contribute to the fit — important when the input has nodata
+    regions that would otherwise skew the fit toward zero.
+
+    Returns uint8 (H, W, 3). Falls back to passing the SR output through
+    unchanged if there are fewer than `min_samples` valid pixels in a channel.
+    """
+    h, w = input_rgb.shape[:2]
+
+    # Downscale SR back to input resolution for paired statistics.
+    if sr_rgb.shape[:2] != (h, w):
+        sr_lr = np.asarray(
+            Image.fromarray(sr_rgb).resize((w, h), Image.LANCZOS)
+        )
+    else:
+        sr_lr = sr_rgb
+
+    sr_lr_f = sr_lr.astype(np.float32)
+    inp_f = input_rgb.astype(np.float32)
+    out_f = sr_rgb.astype(np.float32).copy()
+
+    mask_flat = valid_mask.ravel() if valid_mask is not None else None
+
+    for c in range(3):
+        x = sr_lr_f[:, :, c].ravel()
+        y = inp_f[:, :, c].ravel()
+        if mask_flat is not None:
+            x = x[mask_flat]
+            y = y[mask_flat]
+        if x.size < min_samples:
+            continue  # not enough samples to fit reliably; leave channel as-is
+
+        # Least-squares fit y = a*x^2 + b*x + k
+        A = np.stack([x * x, x, np.ones_like(x)], axis=1)
+        try:
+            coefs, *_ = np.linalg.lstsq(A, y, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+        a, b, k = coefs
+
+        sr_c = out_f[:, :, c]
+        out_f[:, :, c] = a * sr_c * sr_c + b * sr_c + k
+
+    return np.clip(out_f, 0.0, 255.0).astype(np.uint8)
+
+
 async def run_job(
     job_id: str,
     settings: Settings,
@@ -246,6 +307,17 @@ async def run_job(
                                 Image.fromarray(tile_rgb_out).resize(
                                     (out_tile_size, out_tile_size), Image.LANCZOS
                                 )
+                            )
+
+                        # Per-channel quadratic color match: bring the SR output's
+                        # color statistics back in line with the input. Reduces
+                        # visible seams between tiles and model color drift.
+                        if settings.color_match:
+                            tile_rgb_out = _color_match_quadratic(
+                                sr_rgb=tile_rgb_out,
+                                input_rgb=tile_rgb_in,
+                                valid_mask=valid_mask,
+                                min_samples=settings.color_match_min_samples,
                             )
 
                         # If the input had any nodata pixels, upscale the validity

@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     # applied twice in this workflow = 4x linear upscale.
     upscale_factor: int = 4
 
+    # --- Color matching ---
+    # Per-tile, per-channel quadratic fit: solve y = a*x^2 + b*x + c for the
+    # mapping from SR-downscaled-to-input-resolution → input. Apply the
+    # polynomial to the full SR output. Preserves SR detail while matching
+    # the input's color statistics. Big reduction in visible tile seams and
+    # in "model color drift" (saturation/hue/brightness shifts).
+    # Set false to ship the model's raw output.
+    color_match: bool = True
+    # Minimum valid pixels per tile to bother fitting. Below this, the SR
+    # output is passed through uncorrected (avoids overfitting on a few
+    # pixels at masked edges).
+    color_match_min_samples: int = 256
+
     # --- Storage paths ---
     jobs_db_path: Path = Path("/data/jobs.db")
     tmp_dir: Path = Path("/data/tmp")
