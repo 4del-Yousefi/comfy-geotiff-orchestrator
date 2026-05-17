@@ -1,11 +1,12 @@
 """FastAPI HTTP layer. The Cloudflare Worker is the only intended caller.
 
 Endpoints:
-  POST /v1/jobs            create a job (worker has already uploaded the TIFF to R2)
-  GET  /v1/jobs/{id}       get job status (incl. signed output URL when COMPLETED)
-  GET  /v1/jobs            list recent
-  POST /v1/upload-url      mint a presigned R2 PUT URL for the client to upload directly
-  GET  /healthz            liveness, no auth
+  POST /v1/jobs                 create a job (worker has already uploaded the TIFF to R2)
+  GET  /v1/jobs/{id}            get job status (incl. signed output URL when COMPLETED)
+  POST /v1/jobs/{id}/cancel     cancel an in-flight job
+  GET  /v1/jobs                 list recent
+  POST /v1/upload-url           mint a presigned R2 PUT URL for the client to upload directly
+  GET  /healthz                 liveness, no auth
 """
 
 import asyncio
@@ -34,6 +35,8 @@ _db: JobStore | None = None
 _storage: StorageClient | None = None
 _runpod: RunPodClient | None = None
 _job_semaphore: asyncio.Semaphore | None = None
+# Track in-flight asyncio tasks per job_id so we can cancel them
+_running_tasks: dict[str, asyncio.Task] = {}
 
 
 @asynccontextmanager
@@ -112,9 +115,22 @@ class UploadUrlResp(BaseModel):
 # ---- Helpers ---------------------------------------------------------------
 async def _job_runner(job_id: str) -> None:
     assert _job_semaphore is not None
-    async with _job_semaphore:
-        assert _db and _storage and _runpod
-        await run_job(job_id, settings, _db, _storage, _runpod)
+    try:
+        async with _job_semaphore:
+            assert _db and _storage and _runpod
+            await run_job(job_id, settings, _db, _storage, _runpod)
+    except asyncio.CancelledError:
+        log.info(f"job {job_id} cancelled by request")
+        if _db is not None:
+            try:
+                await _db.update(job_id, status="CANCELLED",
+                                 error="cancelled by request",
+                                 progress_msg="cancelled")
+            except Exception:
+                log.exception("failed to mark job CANCELLED in DB")
+        raise
+    finally:
+        _running_tasks.pop(job_id, None)
 
 
 def _job_to_resp(job: dict) -> JobResp:
@@ -162,7 +178,8 @@ async def create_job(req: CreateJobReq):
         overlap_ratio=req.overlap_ratio,
         upscale_factor=req.upscale_factor,
     )
-    asyncio.create_task(_job_runner(job_id))
+    task = asyncio.create_task(_job_runner(job_id))
+    _running_tasks[job_id] = task
     job = await _db.get(job_id)
     assert job is not None
     return _job_to_resp(job)
@@ -174,6 +191,38 @@ async def get_job(job_id: str):
     job = await _db.get(job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="job not found")
+    return _job_to_resp(job)
+
+
+@app.post("/v1/jobs/{job_id}/cancel", response_model=JobResp, dependencies=[Depends(require_token)])
+async def cancel_job(job_id: str):
+    """Cancel an in-flight job. Idempotent — safe to call multiple times.
+
+    If the job is still running, its asyncio task is cancelled; the pipeline
+    aborts at the next checkpoint, in-flight RunPod tile requests are left
+    running (they'll time out on their own) and the DB row is marked CANCELLED.
+
+    If the job is already in a terminal state, returns the current row unchanged.
+    """
+    assert _db
+    job = await _db.get(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="job not found")
+
+    if job["status"] in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+        return _job_to_resp(job)
+
+    task = _running_tasks.get(job_id)
+    if task is not None and not task.done():
+        task.cancel()
+        # The _job_runner's CancelledError handler will mark DB as CANCELLED.
+    else:
+        # No live task (e.g., orchestrator restarted mid-job). Mark DB directly.
+        await _db.update(job_id, status="CANCELLED",
+                         error="cancelled (no live task)",
+                         progress_msg="cancelled")
+
+    job = await _db.get(job_id)
     return _job_to_resp(job)
 
 
